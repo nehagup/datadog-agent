@@ -41,7 +41,7 @@ class GithubAPI:
 
     def __init__(self, repository="DataDog/datadog-agent", public_repo=False):
         self._auth = self._chose_auth(public_repo)
-        self._github = Github(auth=self._auth)
+        self._github = Github(auth=self._auth, per_page=100)
         org = repository.split("/")
         self._organization = org[0] if len(org) > 1 else None
         self._repository = self._github.get_repo(repository)
@@ -464,10 +464,16 @@ class GithubAPI:
         """
         Get the members of a team.
         """
+        team = self.get_team(team_slug)
+        return team.get_members()
+
+    def get_team(self, team_slug: str):
+        """
+        Get the team object.
+        """
         assert self._organization
         org = self._github.get_organization(self._organization)
-        team = org.get_team_by_slug(team_slug)
-        return team.get_members()
+        return org.get_team_by_slug(team_slug)
 
     def search_issues(self, query: str):
         """
@@ -612,9 +618,11 @@ class GithubAPI:
             return 'long review'
         return 'medium review'
 
-    def find_all_teams(self, obj, exclude_teams=None, exclude_permissions=None):
-        """Get all the repositories teams, including the nested ones."""
+    def find_teams(self, obj, exclude_teams=None, exclude_permissions=None, depth=None):
+        """Get teams from a Github object (repository or team)"""
         teams = []
+        if depth is not None:
+            depth -= 1
         for team in obj.get_teams():
             if (
                 exclude_teams
@@ -624,31 +632,29 @@ class GithubAPI:
             ):
                 continue
             teams.append(team)
-            teams.extend(
-                self.find_all_teams(team, exclude_teams=exclude_teams, exclude_permissions=exclude_permissions)
-            )
+            if depth is None or depth > 0:
+                teams.extend(self.find_teams(team, depth=depth))
         return teams
 
-    def get_committers(self, duration_days=183):
-        """Get the set of committers within the last <duration_days>"""
-        comitters = set()
-        since_date = datetime.now() - timedelta(days=duration_days)
-        for commit in self._repository.get_commits(since=since_date):
-            if commit.author:
-                comitters.add(commit.author.login)
-        return comitters
-
-    def get_reviewers(self, duration_days=183):
+    def get_active_users(self, duration_days=183):
         """Get the set of reviewers within the last <duration_days>"""
-        reviewers = set()
+        actors = set()
         since_date = datetime.now() - timedelta(days=duration_days)
         for pr in self._repository.get_pulls(state="all"):
+            actors.add(pr.user.login)
             if pr.created_at < since_date:
                 break
             for review in pr.get_reviews():
                 if review.user:
-                    reviewers.add(review.user.login)
-        return reviewers
+                    actors.add(review.user.login)
+        return actors
+
+    def get_direct_team_members(self, team):
+        query = '{ organization(login: "datadog") { team(slug: "TEAM")  { members(membership: IMMEDIATE) { nodes { login } } } } }'.replace(
+            "TEAM", team
+        )
+        data = self.graphql(query)
+        return [member["login"] for member in data["data"]["organization"]["team"]["members"]["nodes"]]
 
 
 def get_github_teams(users):
@@ -739,11 +745,15 @@ Make sure that milestone is open before trying again.""",
 
 
 def create_release_pr(title, base_branch, target_branch, version, changelog_pr=False, milestone=None):
-    milestone_name = milestone or str(version)
+    if milestone:
+        milestone_name = milestone
+    else:
+        from tasks.libs.releasing.json import get_current_milestone
+
+        milestone_name = get_current_milestone()
 
     labels = [
         "team/agent-delivery",
-        "team/agent-release-management",
     ]
     if changelog_pr:
         labels.append(f"backport/{get_default_branch()}")

@@ -28,6 +28,8 @@ type Config struct {
 	// config-wide and "compiled" fields
 	schedule map[Schedule][]*Profile
 	events   map[string]*Event
+
+	StartupTraceSampling float64 `yaml:"startup_trace_sampling"`
 }
 
 // Profile is a single agent telemetry profile
@@ -210,6 +212,10 @@ var defaultProfiles = `
         - name: logs.dropped
         - name: logs.encoded_bytes_sent
         - name: logs.sender_latency
+        - name: logs.auto_multi_line_aggregator_flush
+          aggregate_tags:
+            - truncated
+            - line_type
         - name: point.sent
         - name: point.dropped
         - name: transactions.input_count

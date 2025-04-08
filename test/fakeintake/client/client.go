@@ -56,6 +56,7 @@ import (
 
 	agentmodel "github.com/DataDog/agent-payload/v5/process"
 
+	"github.com/DataDog/datadog-agent/pkg/metrics/event"
 	"github.com/DataDog/datadog-agent/test/fakeintake/aggregator"
 	"github.com/DataDog/datadog-agent/test/fakeintake/api"
 	"github.com/DataDog/datadog-agent/test/fakeintake/client/flare"
@@ -64,6 +65,7 @@ import (
 const (
 	fakeintakeIDHeader           = "Fakeintake-ID"
 	metricsEndpoint              = "/api/v2/series"
+	intakeEndpoint               = "/intake/"
 	checkRunsEndpoint            = "/api/v1/check_run"
 	logsEndpoint                 = "/api/v2/logs"
 	connectionsEndpoint          = "/api/v1/connections"
@@ -79,6 +81,7 @@ const (
 	orchestratorEndpoint         = "/api/v2/orch"
 	orchestratorManifestEndpoint = "/api/v2/orchmanif"
 	metadataEndpoint             = "/api/v1/metadata"
+	ndmEndpoint                  = "/api/v2/ndm"
 	ndmflowEndpoint              = "/api/v2/ndmflow"
 	netpathEndpoint              = "/api/v2/netpath"
 	apmTelemetryEndpoint         = "/api/v2/apmtelemetry"
@@ -106,6 +109,7 @@ type Client struct {
 
 	metricAggregator               aggregator.MetricAggregator
 	checkRunAggregator             aggregator.CheckRunAggregator
+	eventAggregator                aggregator.EventAggregator
 	logAggregator                  aggregator.LogAggregator
 	connectionAggregator           aggregator.ConnectionsAggregator
 	processAggregator              aggregator.ProcessAggregator
@@ -119,6 +123,7 @@ type Client struct {
 	orchestratorAggregator         aggregator.OrchestratorAggregator
 	orchestratorManifestAggregator aggregator.OrchestratorManifestAggregator
 	metadataAggregator             aggregator.MetadataAggregator
+	ndmAggregator                  aggregator.NDMAggregator
 	ndmflowAggregator              aggregator.NDMFlowAggregator
 	netpathAggregator              aggregator.NetpathAggregator
 	serviceDiscoveryAggregator     aggregator.ServiceDiscoveryAggregator
@@ -133,6 +138,7 @@ func NewClient(fakeIntakeURL string, opts ...Option) *Client {
 		fakeIntakeURL:                  strings.TrimSuffix(fakeIntakeURL, "/"),
 		metricAggregator:               aggregator.NewMetricAggregator(),
 		checkRunAggregator:             aggregator.NewCheckRunAggregator(),
+		eventAggregator:                aggregator.NewEventAggregator(),
 		logAggregator:                  aggregator.NewLogAggregator(),
 		connectionAggregator:           aggregator.NewConnectionsAggregator(),
 		processAggregator:              aggregator.NewProcessAggregator(),
@@ -146,6 +152,7 @@ func NewClient(fakeIntakeURL string, opts ...Option) *Client {
 		orchestratorAggregator:         aggregator.NewOrchestratorAggregator(),
 		orchestratorManifestAggregator: aggregator.NewOrchestratorManifestAggregator(),
 		metadataAggregator:             aggregator.NewMetadataAggregator(),
+		ndmAggregator:                  aggregator.NewNDMAggregator(),
 		ndmflowAggregator:              aggregator.NewNDMFlowAggregator(),
 		netpathAggregator:              aggregator.NewNetpathAggregator(),
 		serviceDiscoveryAggregator:     aggregator.NewServiceDiscoveryAggregator(),
@@ -177,6 +184,14 @@ func (c *Client) getCheckRuns() error {
 		return err
 	}
 	return c.checkRunAggregator.UnmarshallPayloads(payloads)
+}
+
+func (c *Client) getEvents() error {
+	payloads, err := c.getFakePayloads(intakeEndpoint)
+	if err != nil {
+		return err
+	}
+	return c.eventAggregator.UnmarshallPayloads(payloads)
 }
 
 func (c *Client) getLogs() error {
@@ -275,6 +290,14 @@ func (c *Client) getAPMStats() error {
 	return c.apmStatsAggregator.UnmarshallPayloads(payloads)
 }
 
+func (c *Client) getNDMPayloads() error {
+	payloads, err := c.getFakePayloads(ndmEndpoint)
+	if err != nil {
+		return err
+	}
+	return c.ndmAggregator.UnmarshallPayloads(payloads)
+}
+
 func (c *Client) getNDMFlows() error {
 	payloads, err := c.getFakePayloads(ndmflowEndpoint)
 	if err != nil {
@@ -309,6 +332,16 @@ func (c *Client) FilterCheckRuns(name string, options ...MatchOpt[*aggregator.Ch
 		return nil, err
 	}
 	return filterPayload(checkRuns, options...)
+}
+
+// FilterEvents fetches fakeintake on `/intake/` endpoint and returns
+// events matching `name` and any [MatchOpt](#MatchOpt) options
+func (c *Client) FilterEvents(name string, options ...MatchOpt[*aggregator.Event]) ([]*aggregator.Event, error) {
+	events, err := c.getEvent(name)
+	if err != nil {
+		return nil, err
+	}
+	return filterPayload(events, options...)
 }
 
 // FilterLogs fetches fakeintake on `/api/v2/logs` endpoint, unpackage payloads and returns
@@ -405,6 +438,20 @@ func (c *Client) ConfigureOverride(override api.ResponseOverride) error {
 	return nil
 }
 
+// GetLastAPIKey returns the last apiKey sent with a payload to the intake
+func (c *Client) GetLastAPIKey() (string, error) {
+	resp, err := http.Get(fmt.Sprintf("%s/debug/lastAPIKey", c.fakeIntakeURL))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(body)), nil
+}
+
 func (c *Client) getMetric(name string) ([]*aggregator.MetricSeries, error) {
 	err := c.getMetrics()
 	if err != nil {
@@ -481,6 +528,35 @@ func WithMetricValueHigherThan(minValue float64) MatchOpt[*aggregator.MetricSeri
 			}
 		}
 		// TODO return similarity error score
+		return false, nil
+	}
+}
+
+func (c *Client) getEvent(source string) ([]*aggregator.Event, error) {
+	err := c.getEvents()
+	if err != nil {
+		return nil, err
+	}
+	return c.eventAggregator.GetPayloadsByName(source), nil
+}
+
+// GetEventSources fetches fakeintake on `/intake/` endpoint and returns
+// all received event sources
+func (c *Client) GetEventSources() ([]string, error) {
+	err := c.getEvents()
+	if err != nil {
+		return nil, err
+	}
+	return c.eventAggregator.GetNames(), nil
+}
+
+// WithAlertType filters events by `alertType`
+func WithAlertType(alertType event.AlertType) MatchOpt[*aggregator.Event] {
+	return func(event *aggregator.Event) (bool, error) {
+		if event.AlertType == alertType {
+			return true, nil
+		}
+		// TODO return similarity score in error
 		return false, nil
 	}
 }
@@ -617,6 +693,16 @@ func (c *Client) GetProcesses() ([]*aggregator.ProcessPayload, error) {
 	}
 
 	return procs, nil
+}
+
+// GetLastProcessPayloadAPIKey fetches fakeintake on `/api/v1/collector` endpoint and returns
+// the API key of the last received process payload
+func (c *Client) GetLastProcessPayloadAPIKey() (string, error) {
+	payloads, err := c.getFakePayloads(processesEndpoint)
+	if err != nil {
+		return "", err
+	}
+	return payloads[len(payloads)-1].APIKey, nil
 }
 
 // GetContainers fetches fakeintake on `/api/v1/container` endpoint and returns
@@ -877,6 +963,19 @@ func (c *Client) GetAPMStats() ([]*aggregator.APMStatsPayload, error) {
 	return stats, nil
 }
 
+// GetNDMPayloads fetches fakeintake on `/api/v2/ndm` endpoint and returns all received NDM payloads
+func (c *Client) GetNDMPayloads() ([]*aggregator.NDMPayload, error) {
+	err := c.getNDMPayloads()
+	if err != nil {
+		return nil, err
+	}
+	var ndmDevices []*aggregator.NDMPayload
+	for _, name := range c.ndmAggregator.GetNames() {
+		ndmDevices = append(ndmDevices, c.ndmAggregator.GetPayloadsByName(name)...)
+	}
+	return ndmDevices, nil
+}
+
 // GetNDMFlows fetches fakeintake on `/api/v2/ndmflows` endpoint and returns all received ndmflow payloads
 func (c *Client) GetNDMFlows() ([]*aggregator.NDMFlow, error) {
 	err := c.getNDMFlows()
@@ -890,15 +989,19 @@ func (c *Client) GetNDMFlows() ([]*aggregator.NDMFlow, error) {
 	return ndmflows, nil
 }
 
-// GetNetpathEvents returns the latest netpath events by destination
-func (c *Client) GetNetpathEvents() ([]*aggregator.Netpath, error) {
+// GetLatestNetpathEvents returns the latest netpath events by destination
+func (c *Client) GetLatestNetpathEvents() ([]*aggregator.Netpath, error) {
 	err := c.getNetpathEvents()
 	if err != nil {
 		return nil, err
 	}
 	var netpaths []*aggregator.Netpath
 	for _, name := range c.netpathAggregator.GetNames() {
-		netpaths = append(netpaths, c.netpathAggregator.GetPayloadsByName(name)...)
+		payloads := c.netpathAggregator.GetPayloadsByName(name)
+		if len(payloads) > 0 {
+			// take the latest payload for this destination
+			netpaths = append(netpaths, payloads[len(payloads)-1])
+		}
 	}
 	return netpaths, nil
 }
